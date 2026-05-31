@@ -1,0 +1,18 @@
+services:
+  onfg_gunshot_classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: onfg_gunshot_classifier:latest
+    shm_size: '2gb'  # <--- Augmente la mémoire partagée ici
+    container_name: onfg_gunshot_classifier
+    restart: no
+    working_dir: /app
+    volumes:
+      - ./src:/app
+      - ./audio_to_analyze:/data/audio
+      - ./results:/data/results
+    environment:
+      - PYTHONUNBUFFERED=1
+    tty: true
+    command: bash
