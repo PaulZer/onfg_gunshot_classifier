@@ -1,88 +1,158 @@
+"""
+classify_gunshots.py
+====================
+Classifieur de coups de feu en forêt tropicale.
+Basé sur : https://github.com/lydiakatsis/tropical_forest_gunshot_classifier
+Compatible opensoundscape 0.7.1
+"""
+
 import os
+import sys
+import warnings
+import traceback
 import torch
+import torch.nn.functional as F
 import pandas as pd
 from glob import glob
-from opensoundscape.torch.models.cnn import CNN
+from opensoundscape.torch.datasets import AudioSplittingDataset
+from torch.utils.data import DataLoader
 
-AUDIO_DIR = "/data/audio"
+# ════════════════════════════════════════════════════════════
+#  CONFIG — à adapter
+# ════════════════════════════════════════════════════════════
+AUDIO_DIR  = "/data/audio"
 OUTPUT_DIR = "/data/results"
-MODEL_PATH = "/data/lydiakatsis/tropical_forest_gunshot_classifier/Model and code/best.model"
+MODEL_PATH = ("/data/lydiakatsis/tropical_forest_gunshot_classifier/"
+              "Model and code/best.model")
+CLIP_DURATION = 4.0   # secondes
+THRESHOLD     = 0.2   # seuil de détection
+# ════════════════════════════════════════════════════════════
+
+
+def fmt_time(seconds):
+    """Convertit des secondes en HH:MM:SS."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def load_model(model_path, sample_duration=4.0):
+    from opensoundscape.torch.models.cnn import load_outdated_model
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = load_outdated_model(model_path, 'resnet18', sample_duration)
+    model.preprocessor.pipeline.to_img.set(invert=True)
+    model.preprocessor.pipeline.bandpass.set(out_of_bounds_ok=True)
+    return model
+
+
+def predict(model, audio_files):
+    all_rows = []
+    for filepath in audio_files:
+        try:
+            dataset = AudioSplittingDataset(
+                [filepath], model.preprocessor, final_clip='extend'
+            )
+            dataset.bypass_augmentations = True
+            if len(dataset) == 0:
+                print(f"  ⚠ {os.path.basename(filepath)} : aucun clip généré, ignoré")
+                continue
+
+            loader = DataLoader(dataset, batch_size=16, num_workers=0)
+            file_logits, file_times = [], []
+            model.network.eval()
+            with torch.no_grad():
+                for batch in loader:
+                    probs = F.softmax(model.network(batch['X']), dim=1)
+                    file_logits.append(probs.cpu())
+                    if 'start_time' in batch:
+                        for s, e in zip(batch['start_time'], batch['end_time']):
+                            file_times.append((float(s), float(e)))
+                    else:
+                        dur = model.preprocessor.sample_duration
+                        for i in range(batch['X'].shape[0]):
+                            file_times.append((i * dur, (i + 1) * dur))
+
+            all_probs = torch.cat(file_logits, dim=0).numpy()
+            for i, (s, e) in enumerate(file_times):
+                row = {'file': filepath, 'start_time': s, 'end_time': e}
+                for j, cls in enumerate(model.classes):
+                    row[cls] = round(float(all_probs[i, j]), 3)
+                all_rows.append(row)
+
+        except Exception as exc:
+            print(f"  ✗ {os.path.basename(filepath)} : {exc}")
+            traceback.print_exc()
+
+    return pd.DataFrame(all_rows)
+
 
 def main():
-    print("--- Démarrage du classifier (Tri par fichier & Seuil > 0.2) ---")
-    
-    # 1. Collecte des fichiers audio
-    audio_files = glob(os.path.join(AUDIO_DIR, "*.wav")) + glob(os.path.join(AUDIO_DIR, "*.WAV")) + glob(os.path.join(AUDIO_DIR, "*.mp3"))
+    # Collecte fichiers
+    audio_files = sorted(set(
+        f for pat in ["*.wav", "*.WAV", "*.mp3", "*.MP3", "*.flac", "*.FLAC"]
+        for f in glob(os.path.join(AUDIO_DIR, pat))
+    ))
     if not audio_files:
-        print(f"Erreur : Aucun fichier trouvé dans {AUDIO_DIR}")
-        return
-    print(f"{len(audio_files)} fichier(s) audio détecté(s).")
+        print(f"✗ Aucun fichier audio dans : {AUDIO_DIR}"); sys.exit(1)
+    print(f"{len(audio_files)} fichier(s) détecté(s)")
 
-    # 2. Chargement et conversion du modèle (Compatibilité v0.7.1)
-    loaded_dict = torch.load(MODEL_PATH, map_location=torch.device('cpu'))
-    raw_state_dict = loaded_dict['model_state_dict'] if isinstance(loaded_dict, dict) and 'model_state_dict' in loaded_dict else loaded_dict
+    # Chargement modèle
+    if not os.path.isfile(MODEL_PATH):
+        print(f"✗ Modèle introuvable : {MODEL_PATH}"); sys.exit(1)
+    print("Chargement du modèle...", end=" ", flush=True)
+    model = load_model(MODEL_PATH, CLIP_DURATION)
+    print("✓")
 
-    cleaned_state_dict = {}
-    for key, value in raw_state_dict.items():
-        new_key = key.replace("feature.", "") if key.startswith("feature.") else key
-        if key.startswith("classifier."):
-            new_key = key.replace("classifier.", "fc.")
-        cleaned_state_dict[new_key] = value
+    # Prédiction
+    print("Analyse en cours...")
+    warnings.filterwarnings("ignore", category=UserWarning, message="Failed to load metadata")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        results = predict(model, audio_files)
 
-    model = CNN(architecture='resnet18', classes=['0', '1'], sample_duration=5.0) 
-    model.network.load_state_dict(cleaned_state_dict)
+    if results.empty:
+        print("✗ Aucun résultat produit."); sys.exit(1)
 
-    df = pd.DataFrame(index=audio_files)
+    # Renommage colonnes
+    rename = {}
+    for col in results.columns:
+        if str(col).lower() in ('negative', 'background', 'bg'):
+            rename[col] = 'background'
+        elif str(col).lower() in ('positive', 'gunshot', 'gun'):
+            rename[col] = 'gunshot'
+    if rename:
+        results = results.rename(columns=rename)
 
-    print("Analyse et calcul des probabilités (Softmax)...")
-    try:
-        result = model.predict(
-            df, 
-            batch_size=64, 
-            num_workers=2,
-            activation_layer='softmax'
-        )
-        
-        # Extraction du DataFrame des prédictions
-        predictions_df = result[0] if isinstance(result, tuple) else result
-        
-        # Passer de l'index multi-niveau à des colonnes standards
-        final_table = predictions_df.reset_index()
-        
-        # Renommer les colonnes pour plus de clarté
-        final_table = final_table.rename(columns={
-            'index_file': 'file',
-            '0': 'prob_pas_de_tir',
-            '1': 'prob_coup_de_feu'
-        })
+    score_col = 'gunshot' if 'gunshot' in results.columns else \
+                next(c for c in results.columns if c not in ('file', 'start_time', 'end_time'))
 
-        # 3. FILTRAGE : On garde uniquement les scores de coups de feu > 0.2
-        final_table = final_table[final_table['prob_coup_de_feu'] > 0.2]
+    # Filtrage + tri : par fichier (A→Z) puis score décroissant
+    filtered = (results[results[score_col] > THRESHOLD]
+                .sort_values(['file', score_col], ascending=[True, False])
+                .reset_index(drop=True))
 
-        if final_table.empty:
-            print("\n[Info] Aucun segment n'a dépassé le seuil de 0.2 de probabilité.")
-            print("Le fichier CSV ne sera pas généré car il est vide.")
-            return
+    # Affichage
+    print(f"\nRésultats filtrés (gunshot > {THRESHOLD}) — {len(filtered)} segment(s) :\n")
+    if filtered.empty:
+        print("  Aucun segment détecté.")
+        print(f"\n  Top-5 scores :")
+        print(results.nlargest(5, score_col)[['file', 'start_time', 'end_time', score_col]]
+              .to_string(index=False))
+    else:
+        display = filtered.copy()
+        display['start_time'] = display['start_time'].apply(fmt_time)
+        display['end_time']   = display['end_time'].apply(fmt_time)
+        print(display[['file', 'start_time', 'end_time', 'background', score_col]]
+              .to_string(index=False))
 
-        # 4. TRI : Par nom de fichier (A-Z) puis par probabilité de coup de feu (descendante)
-        final_table = final_table.sort_values(by=['file', 'prob_coup_de_feu'], ascending=[True, False])
-
-        # 5. Sauvegarde du fichier CSV filtré
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        output_file = os.path.join(OUTPUT_DIR, "classified_gunshots.csv")
-        
-        final_table.to_csv(output_file, index=False)
-        
-        print(f"\nSuccès ! Le fichier filtré et trié a été sauvegardé.")
-        print(f"Chemin du fichier : {output_file}")
-        print(f"Nombre de lignes retenues (> 0.2) : {len(final_table)}")
-        
-        # Aperçu rapide dans le terminal
-        print("\nAperçu des premiers résultats enregistrés :")
-        print(final_table[['file', 'start_time', 'end_time', 'prob_coup_de_feu']].head(10))
-            
-    except Exception as e:
-        print(f"Une erreur est survenue lors de la prédiction : {e}")
+        out = os.path.join(OUTPUT_DIR, "classified_gunshots.csv")
+        # CSV avec temps formatés également
+        filtered.to_csv(out, index=False, float_format="%.2f")
+        print(f"\n✓ CSV sauvegardé : {out}")
+
 
 if __name__ == "__main__":
     main()
