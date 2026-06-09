@@ -30,69 +30,60 @@ Au cœur de l'outil se trouve un **modèle entraîné**, c'est-à-dire un progra
 
 ---
 
-## Prérequis
+## Guide d'utilisation
 
-L'outil fonctionne sur un conteneur Docker sous Linux disposant de Python 3, et de toutes les dépendances nécessaires et du fichier du modèle `best.model`, disponible dans le dépôt GitHub du projet original.
+### 📂 Étape 1 : Où déposer vos enregistrements audio ?
+
+Avant de lancer l'analyse, vous devez copier vos fichiers audio au format `.WAV` dans le dossier partagé de votre ordinateur prévu à cet effet :
+
+* **Dossier d'entrée :** `audio_a_analyser` (ou le nom défini sur votre machine).
+* *Note : Veillez à ce que les extensions de vos fichiers soient bien en majuscules ou minuscules (`.wav`, `.WAV`).*
 
 ---
 
-## Utilisation
+### 🚀 Étape 2 : Lancer l'analyse
 
-### 1. Préparer vos fichiers
+L'analyse se lance très simplement depuis le terminal (invite de commandes) grâce à Docker. 
 
-Placez vos enregistrements audio (formats acceptés : `.wav`, `.WAV`, `.mp3`, `.flac`) dans le dossier `/audio_to_analyze`, à la racine du projet.
+Tapez ou copiez-collez la commande suivante et appuyez sur **Entrée** :
 
-### 2. Configurer le script (optionnel)
-
-Ouvrez le fichier `classify_gunshots.py` avec un éditeur de texte. En haut du fichier, modifiez les trois lignes suivantes pour qu'elles correspondent à votre situation :
-
-```python
-AUDIO_DIR  = "/data/audio"          # Dossier contenant vos enregistrements
-OUTPUT_DIR = "/data/results"        # Dossier où sera sauvegardé le tableau de résultats
-MODEL_PATH = "/data/.../best.model" # Chemin vers le fichier du modèle
+```bash
+docker compose exec classifier python predict_GUNSHOT_classifier.py
 ```
+Le programme va afficher sa progression fichier par fichier (ex: `[1/12] Analyse de Rec_20260609.WAV`...).
 
-Vous pouvez également ajuster ces deux paramètres selon vos besoins :
+### 📊 Étape 3 : Comprendre et lire les résultats
+Une fois l'analyse terminée, un nouveau dossier apparaît sur votre ordinateur. Son nom contient la date du jour (par exemple : `Outputs_predictions_260609`).
 
-| Paramètre | Valeur par défaut | Rôle |
-|---|---|---|
-| `THRESHOLD` | `0.5` | Seuil de détection. Augmenter réduit les fausses alarmes ; diminuer permet de ne rien rater. |
-| `CLIP_OVERLAP` | `0.5` | Chevauchement entre fenêtres (50%). Augmenter améliore la détection mais allonge le temps d'analyse. |
+À l'intérieur, vous trouverez deux fichiers que vous pouvez ouvrir directement avec Excel, LibreOffice ou Google Sheets :
 
-### 3. Lancer l'analyse
+#### 1. `GUNSHOT_scores.csv` (Le plus utile)
+Ce fichier classe tous les morceaux analysés, du plus suspect au moins suspect. Le premier morceau de la liste est celui où le système est le plus certain d'avoir entendu un coup de feu.
 
-Dans un terminal, exécutez :
+Voici à quoi ressemblent les colonnes :
 
-```
-python classify_gunshots.py
-```
+- **index** : Le nom du fichier audio suivi de la seconde exacte du morceau (ex: `0.00-4.00` pour les 4 premières secondes).
 
-L'avancement s'affiche en temps réel. Pour un enregistrement d'une heure, comptez environ 5 à 15 minutes d'analyse selon votre matériel.
+- **start_time** : L'heure de début du morceau dans le fichier (au format Heure:Minute:Seconde).
 
-### 4. Lire les résultats
+- **end_time** : L'heure de fin du morceau dans le fichier.
 
-Un fichier `classified_gunshots.csv` est créé dans votre dossier de résultats. Chaque ligne correspond à une fenêtre de 4 secondes détectée comme coup de feu potentiel :
+- **negative** : La confiance du modèle que ce soit un bruit de fond normal (oiseau, pluie, vent...).
 
-| Colonne | Signification |
-|---|---|
-| `file` | Nom du fichier audio analysé |
-| `start_time` | Heure de début de la fenêtre dans l'enregistrement (format HH:MM:SS) |
-| `end_time` | Heure de fin de la fenêtre |
-| `background` | Score de probabilité que ce soit un bruit de fond (entre 0 et 1) |
-| `gunshot` | Score de probabilité que ce soit un coup de feu (entre 0 et 1) |
+- **positive** : La confiance du modèle que ce soit un coup de feu (un score de `0.950` signifie plus ou moins 95% de certitude).
 
-Les résultats sont triés par fichier, puis par score décroissant : les détections les plus certaines apparaissent en premier.
+💡 Pour l'analyse, commencez par le haut du fichier, regardez la colonne `positive`, qui est triée par scores décroissants, et concentrez-vous sur les scores les plus proches de `1.0`. 
 
-**Exemple de sortie :**
+#### 2. `GUNSHOT_binary_predictions.csv`
+Ce fichier applique une décision stricte ("Oui" ou "Non") selon un seuil scientifique pré-configuré (environ 80% de certitude).
 
-```
-                        file  start_time  end_time  background  gunshot
-/data/audio/terrain_01.WAV    00:14:32    00:14:36       0.001    0.999
-/data/audio/terrain_01.WAV    00:14:30    00:14:34       0.014    0.986
-/data/audio/terrain_01.WAV    00:52:08    00:52:12       0.038    0.962
-```
+- Si la colonne `positive` affiche `1`, le système considère qu'il s'agit officiellement d'un coup de feu.
 
-> **Conseil de lecture :** Plusieurs lignes consécutives avec des timecodes proches correspondent souvent au même coup de feu détecté dans des fenêtres qui se chevauchent. Il s'agit donc d'un seul événement, pas de plusieurs tirs.
+- Si elle affiche `0`, le bruit est classé comme bruit de fond.
+
+### 🔍 Étape 4 : Contrôler les résultats
+
+Grâce aux colonnes `start_time` et `end_time`, vous disposez de la fenêtre de détection exacte d'un coup de feu supposé. Vous pouvez alors ouvrir le fichier audio original dans un logiciel de visualisation sonore comme **Raven Lite** ou **Audacity** et écouter le passage indiqué pour confirmer par vous-même si le coup de feu est positif (réellement détecté), négatif (bruit de fond), ou s'il s'agit d'un faux positif (erreur du modèle).
 
 ---
 
