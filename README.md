@@ -32,6 +32,7 @@ Au cœur de l'outil se trouve un **modèle entraîné**, c'est-à-dire un progra
 
 ## Guide d'utilisation
 
+
 ### 📂 Étape 1 : Où déposer vos enregistrements audio ?
 
 Avant de lancer l'analyse, vous devez copier vos fichiers audio au format `.WAV` dans le dossier partagé de votre ordinateur prévu à cet effet :
@@ -51,6 +52,8 @@ Tapez ou copiez-collez la commande suivante et appuyez sur **Entrée** :
 docker compose exec classifier python predict_GUNSHOT_classifier.py
 ```
 Le programme va afficher sa progression fichier par fichier (ex: `[1/12] Analyse de Rec_20260609.WAV`...).
+
+---
 
 ### 📊 Étape 3 : Comprendre et lire les résultats
 Une fois l'analyse terminée, un nouveau dossier apparaît sur votre ordinateur. Son nom contient la date du jour (par exemple : `Outputs_predictions_260609`).
@@ -80,6 +83,8 @@ Ce fichier applique une décision stricte ("Oui" ou "Non") selon un seuil scient
 - Si la colonne `positive` affiche `1`, le système considère qu'il s'agit officiellement d'un coup de feu.
 
 - Si elle affiche `0`, le bruit est classé comme bruit de fond.
+
+---
 
 ### 🔍 Étape 4 : Contrôler les résultats
 
