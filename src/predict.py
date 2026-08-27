@@ -2,17 +2,22 @@
 # coding: utf-8
 
 """
-predict_GUNSHOT_classifier.py — Version adaptée pour OpenSoundscape 0.7.1
+predict.py — Version adaptée pour OpenSoundscape 0.7.1
 ========================================================================
 Ajout des colonnes temporelles lisibles au format HH:MM:SS en positions 2 et 3.
+Ajout des colonnes start_datetime / end_datetime (format Y-m-d H:M:S),
+calculées à partir de la date de dernière modification du fichier .WAV
+(considérée comme la date/heure de FIN d'enregistrement) et de la durée
+totale du fichier audio.
 """
 
 import os
+import re
 import sys
 import time
 import warnings
 import traceback
-from datetime import date
+from datetime import date, datetime, timedelta
 from glob import glob
 import numpy as np
 import pandas as pd
@@ -41,6 +46,9 @@ TARGET_SR      = 8000
 MAX_F          = 2000     
 WINDOW_SAMPLES = 256
 OVERLAP_SAMPLES= 128
+
+# Format de sortie pour les colonnes datetime
+DATETIME_FMT   = "%Y-%m-%d %H:%M:%S"
 # ════════════════════════════════════════════════════════════
 
 
@@ -50,6 +58,81 @@ def fmt_time(seconds):
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def parse_datetime_from_filename(filepath):
+    """
+    Tente d'extraire la date/heure de DÉBUT d'enregistrement à partir du nom
+    du fichier (convention standard des enregistreurs type AudioMoth /
+    Wildlife Acoustics Song Meter : l'horodatage du nom de fichier correspond
+    au DÉBUT de l'enregistrement, pas à la fin).
+
+    Retourne un objet datetime si un format connu est reconnu quelque part
+    dans le nom de fichier, sinon None.
+
+    Formats reconnus :
+      - YYYYMMDD_HHMMSS         ex: 20230615_143000.WAV  (AudioMoth par défaut)
+      - YYYY-MM-DD_HH-MM-SS     ex: 2023-06-15_14-30-00.wav
+      - YYYYMMDDHHMMSS          ex: SITE1_20230615143000.wav (14 chiffres collés)
+
+    ⚠ Si vos enregistreurs utilisent une autre convention de nommage,
+    ajoutez/adaptez un pattern ci-dessous.
+    """
+    name = os.path.basename(filepath)
+
+    # Format 1 : YYYYMMDD_HHMMSS
+    m = re.search(r'(\d{8})_(\d{6})', name)
+    if m:
+        date_part, time_part = m.groups()
+        try:
+            return datetime.strptime(date_part + time_part, "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+
+    # Format 2 : YYYY-MM-DD_HH-MM-SS
+    m = re.search(r'(\d{4}-\d{2}-\d{2})[_ ](\d{2}-\d{2}-\d{2})', name)
+    if m:
+        date_part, time_part = m.groups()
+        try:
+            return datetime.strptime(f"{date_part} {time_part.replace('-', ':')}", "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+
+    # Format 3 : YYYYMMDDHHMMSS (14 chiffres consécutifs, isolés)
+    m = re.search(r'(?<!\d)(\d{14})(?!\d)', name)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+
+    return None
+
+
+def get_recording_start_datetime(filepath, total_duration_sec):
+    """
+    Détermine la date/heure de DÉBUT d'enregistrement, avec deux méthodes :
+
+      1) PRIORITAIRE : extraction depuis le nom du fichier (méthode fiable,
+         car indépendante des manipulations de fichiers — copie, transfert,
+         sauvegarde — qui peuvent altérer le mtime).
+
+      2) REPLI : si le nom ne correspond à aucun format connu, on utilise la
+         date de dernière modification du fichier (mtime), en supposant
+         qu'elle correspond à la FIN de l'enregistrement, puis on soustrait
+         la durée totale de l'audio pour obtenir le début.
+
+    Retourne un tuple (datetime_debut, source) où source vaut "filename" ou
+    "mtime_fallback", pour que l'appelant puisse signaler les cas de repli.
+    """
+    start_dt = parse_datetime_from_filename(filepath)
+    if start_dt is not None:
+        return start_dt, "filename"
+
+    mtime = os.path.getmtime(filepath)
+    recording_end_dt = datetime.fromtimestamp(mtime)
+    recording_start_dt = recording_end_dt - timedelta(seconds=total_duration_sec)
+    return recording_start_dt, "mtime_fallback"
 
 
 def load_target_model(model_path, sample_duration=4.0):
@@ -71,6 +154,7 @@ def audio_to_clips(filepath, clip_duration, overlap=0.0, sr=TARGET_SR):
     n_samples_clip = int(clip_duration * sr)
     hop_samples    = int(n_samples_clip * (1.0 - overlap))
     total_samples  = len(y)
+    total_duration_sec = total_samples / sr
     clips = []
 
     start_sample = 0
@@ -86,7 +170,7 @@ def audio_to_clips(filepath, clip_duration, overlap=0.0, sr=TARGET_SR):
         clips.append((start_sec, end_sec, chunk))
         start_sample += hop_samples
 
-    return clips
+    return clips, total_duration_sec
 
 
 def clip_to_tensor_adapted(audio_array, sr, preprocessor):
@@ -155,9 +239,18 @@ def main():
     for idx, filepath in enumerate(file_list):
         print(f"[{idx+1}/{len(file_list)}] Analyse de {os.path.basename(filepath)}...")
         try:
-            clips = audio_to_clips(filepath, CLIP_DURATION, overlap=CLIP_OVERLAP, sr=TARGET_SR)
+            clips, total_duration_sec = audio_to_clips(filepath, CLIP_DURATION, overlap=CLIP_OVERLAP, sr=TARGET_SR)
             if not clips:
                 continue
+
+            # Date/heure de début d'enregistrement : priorité au nom du
+            # fichier, repli sur le mtime si le nom n'est pas reconnu
+            recording_start_dt, dt_source = get_recording_start_datetime(filepath, total_duration_sec)
+            if dt_source == "mtime_fallback":
+                print(f"  ⚠ Date/heure non reconnue dans le nom du fichier "
+                      f"'{os.path.basename(filepath)}' -> repli sur la date de "
+                      f"modification (mtime). Vérifiez la convention de nommage "
+                      f"ou la fiabilité de cette date.")
 
             dataset = ClipDataset(clips, TARGET_SR, model.preprocessor)
             loader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=0)
@@ -171,9 +264,15 @@ def main():
                         start_s = float(batch['start_sec'][i])
                         end_s = float(batch['end_sec'][i])
                         
-                        # Génération des formats lisibles HH:MM:SS
+                        # Génération des formats lisibles HH:MM:SS (relatif au fichier)
                         start_str = fmt_time(start_s)
                         end_str = fmt_time(end_s)
+
+                        # Génération des dates/heures absolues (Y-m-d H:M:S)
+                        start_datetime = recording_start_dt + timedelta(seconds=start_s)
+                        end_datetime = recording_start_dt + timedelta(seconds=end_s)
+                        start_datetime_str = start_datetime.strftime(DATETIME_FMT)
+                        end_datetime_str = end_datetime.strftime(DATETIME_FMT)
                         
                         row_index = f"{filepath}_{start_s:.2f}-{end_s:.2f}"
 
@@ -182,6 +281,8 @@ def main():
                             'index': row_index,
                             'start_time': start_str,
                             'end_time': end_str,
+                            'start_datetime': start_datetime_str,
+                            'end_datetime': end_datetime_str,
                             'negative': round(float(probs[i, 0]), 5),
                             'positive': round(float(probs[i, 1]), 5)
                         })
@@ -192,6 +293,8 @@ def main():
                             'index': row_index,
                             'start_time': start_str,
                             'end_time': end_str,
+                            'start_datetime': start_datetime_str,
+                            'end_datetime': end_datetime_str,
                             'negative': 1 - is_gunshot,
                             'positive': is_gunshot
                         })
@@ -212,8 +315,8 @@ def main():
     df_scores.sort_values(by=['positive'], ascending=False, inplace=True)
     df_preds = df_preds.reindex(df_scores.index)
 
-    # --- RÉORGANISATION DES COLONNES (Index, start_time, end_time, negative, positive) ---
-    desired_order = ['start_time', 'end_time', 'negative', 'positive']
+    # --- RÉORGANISATION DES COLONNES ---
+    desired_order = ['start_datetime', 'end_datetime', 'start_time', 'end_time', 'negative', 'positive']
     df_scores = df_scores[desired_order]
     df_preds = df_preds[desired_order]
 
