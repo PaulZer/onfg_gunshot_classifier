@@ -7,16 +7,18 @@ run_pipeline.py — Exécute la chaîne d'analyse complète en une seule command
 Enchaîne automatiquement les 3 étapes, sans avoir à les lancer une par une :
 
   1. predict.py
-     -> Détection brute des coups de feu sur tous les fichiers .WAV
+     -> Détection brute des coups de feu sur tous les fichiers .WAV,
+        écrite SÉPARÉMENT PAR ENREGISTREUR dans <OUTPUT_DIR>/<recorder_id>/
         (GUNSHOT_scores.csv, GUNSHOT_binary_predictions.csv)
 
   2. deduplicate_detections.py
-     -> Regroupe les fenêtres qui se chevauchent au sein d'un même
-        enregistreur (GUNSHOT_scores_deduplicated.csv)
+     -> Pour CHAQUE enregistreur, regroupe les fenêtres qui se chevauchent
+        (GUNSHOT_scores_deduplicated.csv dans chaque sous-dossier)
 
   3. cross_recorder_simultaneous_events.py
-     -> Recherche les détections simultanées entre enregistreurs différents
-        (SIMULTANEOUS_detections.csv)
+     -> Charge TOUS les enregistreurs et recherche les détections
+        simultanées entre enregistreurs différents
+        (SIMULTANEOUS_detections.csv à la racine du dossier de résultats)
 
 Usage :
     docker compose exec classifier python run_pipeline.py
@@ -32,6 +34,7 @@ le même dossier (src/, monté sur /app dans le conteneur).
 import os
 import sys
 import subprocess
+from glob import glob
 from datetime import date
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))

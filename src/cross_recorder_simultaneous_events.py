@@ -28,7 +28,8 @@ de feu distincts peuvent survenir au même moment dans des secteurs
 différents). Une vérification auditive croisée reste recommandée.
 
 Étapes :
-  1. Charge un GUNSHOT_scores.csv (toutes les fenêtres, tous enregistreurs).
+  1. Charge TOUS les GUNSHOT_scores.csv trouvés sous un dossier de résultats
+     (un par enregistreur, dans <output_dir>/<recorder_id>/), et les combine.
   2. Filtre les fenêtres à haut score (SCORE_THRESHOLD).
   3. Identifie l'enregistreur de chaque fichier (à partir du nom de fichier).
   4. Regroupe d'abord les fenêtres qui se chevauchent AU SEIN d'un même
@@ -38,13 +39,22 @@ différents). Une vérification auditive croisée reste recommandée.
      lorsqu'ils tombent dans la fenêtre de tolérance MAX_TIME_DIFF_SECONDS
      (déduplication "horizontale" / recherche de simultanéité).
   6. Ne conserve que les groupes impliquant AU MOINS 2 enregistreurs
-     distincts, et les exporte pour vérification.
+     distincts, et les exporte dans un unique SIMULTANEOUS_detections.csv
+     à la racine du dossier de résultats (pas dans un sous-dossier
+     d'enregistreur, puisque l'analyse porte sur l'ensemble du réseau).
 
 Usage :
-    python cross_recorder_simultaneous_events.py [chemin_vers_GUNSHOT_scores.csv]
+    # Mode automatique : analyse tous les enregistreurs du dossier de
+    # résultats le plus récent
+    python cross_recorder_simultaneous_events.py
 
-Si aucun chemin n'est fourni, cherche le GUNSHOT_scores.csv le plus récent
-dans /data/results/Outputs_predictions_*/
+    # Mode dossier explicite
+    python cross_recorder_simultaneous_events.py /data/results/Outputs_predictions_XXXXXX
+
+    # Mode fichier unique (rétrocompatibilité : un seul GUNSHOT_scores.csv
+    # déjà combiné, ou un enregistreur en particulier — peu utile seul
+    # puisqu'il faut au moins 2 enregistreurs pour trouver une simultanéité)
+    python cross_recorder_simultaneous_events.py /chemin/vers/GUNSHOT_scores.csv
 """
 
 import os
@@ -85,11 +95,26 @@ CLOCK_OFFSETS = {}
 INDEX_PATTERN = re.compile(r'^(?P<filepath>.+)_(?P<start>\d+\.\d+)-(?P<end>\d+\.\d+)$')
 
 
-def find_latest_scores_csv():
-    candidates = sorted(glob(os.path.join(RESULTS_ROOT, "Outputs_predictions_*", "GUNSHOT_scores.csv")))
+def find_latest_output_dir():
+    """Cherche le dossier Outputs_predictions_* le plus récent sous RESULTS_ROOT."""
+    candidates = sorted(glob(os.path.join(RESULTS_ROOT, "Outputs_predictions_*")))
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
+
+
+def find_recorder_scores_csvs(output_dir):
+    """Trouve tous les GUNSHOT_scores.csv sous <output_dir>/<recorder_id>/."""
+    return sorted(glob(os.path.join(output_dir, "*", "GUNSHOT_scores.csv")))
+
+
+def load_all_recorder_scores(output_dir):
+    """Charge et combine tous les GUNSHOT_scores.csv trouvés sous output_dir."""
+    csv_paths = find_recorder_scores_csvs(output_dir)
+    if not csv_paths:
+        return None, []
+    dfs = [pd.read_csv(p) for p in csv_paths]
+    return pd.concat(dfs, ignore_index=True), csv_paths
 
 
 def parse_index(index_value):
@@ -113,6 +138,14 @@ def extract_recorder_id(filepath):
     return name.split('_')[0]
 
 
+def fmt_time(seconds):
+    """Convertit des secondes (relatives au fichier) en HH:MM:SS."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def dedup_within_recorder(df, max_gap_seconds):
     """
     Étape 1 : fusionne, pour chaque FICHIER, les fenêtres qui se
@@ -134,6 +167,11 @@ def dedup_within_recorder(df, max_gap_seconds):
             best_row = max(rows, key=lambda r: r['positive'])
             start_dt = min(pd.to_datetime(r['start_datetime']) for r in rows) + timedelta(seconds=offset)
             end_dt = max(pd.to_datetime(r['end_datetime']) for r in rows) + timedelta(seconds=offset)
+            # Timecode relatif au fichier (équivalent start_time/end_time de
+            # GUNSHOT_scores.csv), sur la même étendue que start_dt/end_dt,
+            # pour retrouver facilement le passage dans l'enregistrement.
+            start_sec_group = min(r['start_sec'] for r in rows)
+            end_sec_group = max(r['end_sec'] for r in rows)
             events.append({
                 'event_id': event_counter,
                 'recorder_id': recorder_id,
@@ -141,6 +179,8 @@ def dedup_within_recorder(df, max_gap_seconds):
                 'n_windows_in_group': len(rows),
                 'start_datetime': start_dt,
                 'end_datetime': end_dt,
+                'start_time': fmt_time(start_sec_group),
+                'end_time': fmt_time(end_sec_group),
                 'best_score': best_row['positive'],
                 'best_index': best_row['index'],
             })
@@ -196,22 +236,36 @@ def cluster_across_recorders(events_df, max_time_diff_seconds):
 
 
 def main():
-    input_path = sys.argv[1] if len(sys.argv) > 1 else find_latest_scores_csv()
-    if not input_path or not os.path.isfile(input_path):
-        print("✗ Fichier GUNSHOT_scores.csv introuvable.")
-        print("  Précisez le chemin en argument, par exemple :")
-        print("  python cross_recorder_simultaneous_events.py /data/results/Outputs_predictions_XXXXXX/GUNSHOT_scores.csv")
-        sys.exit(1)
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
 
-    print(f"📄 Lecture de : {input_path}")
-    df = pd.read_csv(input_path)
+    # ── Mode fichier unique (rétrocompatibilité) ────────────────────────
+    if arg and os.path.isfile(arg):
+        print(f"📄 Mode fichier unique : {arg}")
+        df = pd.read_csv(arg)
+        output_dir = os.path.dirname(arg)
+    else:
+        # ── Mode dossier (multi-enregistreurs) ──────────────────────────
+        output_dir = arg if (arg and os.path.isdir(arg)) else find_latest_output_dir()
+        if not output_dir or not os.path.isdir(output_dir):
+            print("✗ Dossier de résultats introuvable.")
+            print("  Précisez un dossier ou un fichier en argument, par exemple :")
+            print("  python cross_recorder_simultaneous_events.py /data/results/Outputs_predictions_XXXXXX")
+            sys.exit(1)
 
-    required_cols = {'index', 'start_datetime', 'end_datetime', 'positive'}
+        df, csv_paths = load_all_recorder_scores(output_dir)
+        if df is None:
+            print(f"✗ Aucun GUNSHOT_scores.csv trouvé sous {output_dir}/<enregistreur>/")
+            print("  Vérifiez que predict.py a bien été exécuté et a produit des sous-dossiers par enregistreur.")
+            sys.exit(1)
+        print(f"📂 Dossier de résultats : {output_dir}")
+        print(f"📄 {len(csv_paths)} fichier(s) GUNSHOT_scores.csv chargé(s) et combiné(s).")
+
+    required_cols = {'index', 'start_datetime', 'end_datetime', 'start_time', 'end_time', 'positive'}
     missing = required_cols - set(df.columns)
     if missing:
         print(f"✗ Colonnes manquantes dans le CSV : {sorted(missing)}")
         print("  Ce script nécessite un GUNSHOT_scores.csv généré par la version à jour de predict.py")
-        print("  (avec les colonnes start_datetime / end_datetime, calculées à partir du nom de fichier).")
+        print("  (avec les colonnes start_datetime / end_datetime / start_time / end_time).")
         sys.exit(1)
 
     parsed = df['index'].apply(parse_index)
@@ -229,6 +283,10 @@ def main():
 
     n_recorders_total = df_filtered['filepath'].apply(extract_recorder_id).nunique()
     print(f"📡 {n_recorders_total} enregistreur(s) distinct(s) détecté(s) dans les données.")
+
+    if n_recorders_total < 2:
+        print("✗ Un seul enregistreur détecté : aucune simultanéité inter-enregistreurs possible.")
+        return
 
     # Étape 1 : un événement par détection réelle, par enregistreur
     events_df = dedup_within_recorder(df_filtered, MAX_GAP_WITHIN_RECORDER_SECONDS)
@@ -258,12 +316,12 @@ def main():
 
     simultaneous_df.sort_values(by=['cluster_id', 'start_datetime'], inplace=True)
 
-    output_dir = os.path.dirname(input_path)
     output_path = os.path.join(output_dir, "SIMULTANEOUS_detections.csv")
 
     out_cols = [
         'cluster_id', 'n_recorders_in_cluster', 'recorders_in_cluster',
         'recorder_id', 'file', 'start_datetime', 'end_datetime',
+        'start_time', 'end_time',
         'best_score', 'n_windows_in_group', 'best_index'
     ]
     simultaneous_df[out_cols].to_csv(output_path, index=False)

@@ -4,11 +4,14 @@
 """
 predict.py — Version adaptée pour OpenSoundscape 0.7.1
 ========================================================================
-Ajout des colonnes temporelles lisibles au format HH:MM:SS en positions 2 et 3.
-Ajout des colonnes start_datetime / end_datetime (format Y-m-d H:M:S),
-calculées à partir de la date de dernière modification du fichier .WAV
-(considérée comme la date/heure de FIN d'enregistrement) et de la durée
-totale du fichier audio.
+- Colonnes temporelles lisibles au format HH:MM:SS (relatives au fichier).
+- Colonnes start_datetime / end_datetime (format Y-m-d H:M:S), calculées en
+  priorité à partir de l'horodatage contenu dans le nom du fichier audio
+  (repli sur la date de dernière modification si non reconnu).
+- Résultats écrits SÉPARÉMENT PAR ENREGISTREUR (un sous-dossier par
+  identifiant d'enregistreur, extrait du nom de fichier), pour éviter un
+  fichier unique trop volumineux sur plusieurs semaines de déploiement
+  avec de nombreux enregistreurs.
 """
 
 import os
@@ -17,6 +20,7 @@ import sys
 import time
 import warnings
 import traceback
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from glob import glob
 import numpy as np
@@ -58,6 +62,24 @@ def fmt_time(seconds):
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def extract_recorder_id(filepath):
+    """
+    Extrait l'identifiant de l'enregistreur à partir du nom de fichier, afin
+    de produire des fichiers de résultats séparés par enregistreur (et non un
+    seul fichier combiné, qui deviendrait trop volumineux sur plusieurs
+    semaines d'enregistrement avec de nombreux appareils).
+
+    Convention supposée : <ID_ENREGISTREUR>_<YYYYMMDD>_<HHMMSS>.wav
+    ex: '2MA01481_20250423_133241.wav' -> '2MA01481'
+
+    ⚠ Adaptez cette fonction si vos enregistreurs utilisent une autre
+    convention de nommage. Doit rester cohérente avec la même fonction dans
+    deduplicate_detections.py et cross_recorder_simultaneous_events.py.
+    """
+    name = os.path.basename(filepath)
+    return name.split('_')[0]
 
 
 def parse_datetime_from_filename(filepath):
@@ -230,8 +252,11 @@ def main():
     model = load_target_model(MODEL_PATH, CLIP_DURATION)
     print("✓ Prêt.\n")
 
-    full_scores_list = []
-    full_preds_list = []
+    # Accumulation des résultats PAR ENREGISTREUR (et non dans une seule
+    # liste globale), pour produire un jeu de fichiers de résultats distinct
+    # par enregistreur -> fichiers plus légers et faciles à gérer sur des
+    # semaines de déploiement.
+    results_by_recorder = defaultdict(lambda: {'scores': [], 'preds': []})
 
     model.network.eval()
     t_start = time.time()
@@ -239,6 +264,8 @@ def main():
     for idx, filepath in enumerate(file_list):
         print(f"[{idx+1}/{len(file_list)}] Analyse de {os.path.basename(filepath)}...")
         try:
+            recorder_id = extract_recorder_id(filepath)
+
             clips, total_duration_sec = audio_to_clips(filepath, CLIP_DURATION, overlap=CLIP_OVERLAP, sr=TARGET_SR)
             if not clips:
                 continue
@@ -277,7 +304,7 @@ def main():
                         row_index = f"{filepath}_{start_s:.2f}-{end_s:.2f}"
 
                         # 1. Structure pour les scores continus
-                        full_scores_list.append({
+                        results_by_recorder[recorder_id]['scores'].append({
                             'index': row_index,
                             'start_time': start_str,
                             'end_time': end_str,
@@ -289,7 +316,7 @@ def main():
 
                         # 2. Structure pour les décisions binaires
                         is_gunshot = 1 if probs[i, 1] >= THRESHOLD else 0
-                        full_preds_list.append({
+                        results_by_recorder[recorder_id]['preds'].append({
                             'index': row_index,
                             'start_time': start_str,
                             'end_time': end_str,
@@ -303,36 +330,50 @@ def main():
             print(f"  ✗ Erreur sur le fichier {os.path.basename(filepath)} : {e}")
             traceback.print_exc()
 
-    if not full_scores_list:
+    if not results_by_recorder:
         print("✗ Aucun résultat généré.")
         return
 
-    # 4. Conversion en DataFrames
-    df_scores = pd.DataFrame(full_scores_list).set_index('index')
-    df_preds = pd.DataFrame(full_preds_list).set_index('index')
-
-    # Tri global par probabilité de coup de feu décroissante (comme le script d'origine)
-    df_scores.sort_values(by=['positive'], ascending=False, inplace=True)
-    df_preds = df_preds.reindex(df_scores.index)
-
-    # --- RÉORGANISATION DES COLONNES ---
-    desired_order = ['start_datetime', 'end_datetime', 'start_time', 'end_time', 'negative', 'positive']
-    df_scores = df_scores[desired_order]
-    df_preds = df_preds[desired_order]
-
-    # 5. Écritures sur le disque
-    out_scores = os.path.join(OUTPUT_DIR, "GUNSHOT_scores.csv")
-    out_preds = os.path.join(OUTPUT_DIR, "GUNSHOT_binary_predictions.csv")
-
-    df_scores.to_csv(out_scores)
-    df_preds.to_csv(out_preds)
-
     total_time = time.time() - t_start
-    print("\n" + "="*50)
-    print(f"✨ Analyse globale terminée avec succès en {fmt_time(total_time)} !")
-    print(f" -> Scores continus sauvegardés dans : {out_scores}")
-    print(f" -> Décisions binaires (Seuil={THRESHOLD}) dans : {out_preds}")
-    print("="*50)
+    print("\n" + "=" * 60)
+    print(f"✨ Analyse terminée en {fmt_time(total_time)} ! Écriture des résultats par enregistreur :")
+
+    n_recorders = 0
+    n_windows_total = 0
+
+    for recorder_id in sorted(results_by_recorder.keys()):
+        data = results_by_recorder[recorder_id]
+        if not data['scores']:
+            continue
+
+        df_scores = pd.DataFrame(data['scores']).set_index('index')
+        df_preds = pd.DataFrame(data['preds']).set_index('index')
+
+        # Tri par probabilité de coup de feu décroissante (comme le script d'origine)
+        df_scores.sort_values(by=['positive'], ascending=False, inplace=True)
+        df_preds = df_preds.reindex(df_scores.index)
+
+        desired_order = ['start_datetime', 'end_datetime', 'start_time', 'end_time', 'negative', 'positive']
+        df_scores = df_scores[desired_order]
+        df_preds = df_preds[desired_order]
+
+        recorder_dir = os.path.join(OUTPUT_DIR, recorder_id)
+        os.makedirs(recorder_dir, exist_ok=True)
+
+        out_scores = os.path.join(recorder_dir, "GUNSHOT_scores.csv")
+        out_preds = os.path.join(recorder_dir, "GUNSHOT_binary_predictions.csv")
+
+        df_scores.to_csv(out_scores)
+        df_preds.to_csv(out_preds)
+
+        n_recorders += 1
+        n_windows_total += len(df_scores)
+        print(f" -> [{recorder_id}] {len(df_scores)} fenêtre(s) analysée(s) -> {recorder_dir}/")
+
+    print("=" * 60)
+    print(f"✨ {n_recorders} enregistreur(s), {n_windows_total} fenêtre(s) au total, sauvegardés dans : {OUTPUT_DIR}/<enregistreur>/")
+    print(f"   Seuil de décision binaire utilisé : {THRESHOLD}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

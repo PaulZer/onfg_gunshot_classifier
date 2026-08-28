@@ -12,19 +12,27 @@ Avec les valeurs par défaut (4s, 50%), ce décalage vaut 2 secondes.
 Un même coup de feu physique peut donc déclencher plusieurs détections
 consécutives à haut score (une par fenêtre qui le contient).
 
-Ce script :
-  1. Charge un GUNSHOT_scores.csv produit par predict.py.
-  2. Filtre les détections dont le score 'positive' dépasse SCORE_THRESHOLD.
-  3. Regroupe, pour chaque fichier audio, les détections dont les fenêtres
-     se chevauchent ou sont séparées de moins de MAX_GAP_SECONDS.
-  4. Ne conserve qu'une occurrence par groupe (celle au score le plus élevé),
-     ce qui donne une estimation du nombre d'événements RÉELS et distincts.
+predict.py produit désormais un GUNSHOT_scores.csv PAR ENREGISTREUR, dans
+un sous-dossier <OUTPUT_DIR>/<recorder_id>/. Ce script :
+  1. Trouve tous les GUNSHOT_scores.csv sous un dossier de résultats
+     (un par enregistreur), ou traite un fichier unique si demandé.
+  2. Pour chaque enregistreur : filtre les détections à haut score
+     (SCORE_THRESHOLD), regroupe celles dont les fenêtres se chevauchent ou
+     sont séparées de moins de MAX_GAP_SECONDS, et ne conserve qu'une
+     occurrence par groupe (celle au score le plus élevé).
+  3. Écrit un GUNSHOT_scores_deduplicated.csv dans le sous-dossier de
+     chaque enregistreur.
 
 Usage :
-    python deduplicate_detections.py [chemin_vers_GUNSHOT_scores.csv]
+    # Mode automatique : traite tous les enregistreurs du dossier de
+    # résultats le plus récent
+    python deduplicate_detections.py
 
-Si aucun chemin n'est donné, le script cherche automatiquement le
-GUNSHOT_scores.csv le plus récent dans /data/results/Outputs_predictions_*/
+    # Mode dossier explicite : traite tous les enregistreurs sous ce dossier
+    python deduplicate_detections.py /data/results/Outputs_predictions_XXXXXX
+
+    # Mode fichier unique (rétrocompatibilité / usage manuel ponctuel)
+    python deduplicate_detections.py /data/results/Outputs_predictions_XXXXXX/2MA01481/GUNSHOT_scores.csv
 """
 
 import os
@@ -56,12 +64,17 @@ MAX_GAP_SECONDS = 2.0
 INDEX_PATTERN = re.compile(r'^(?P<filepath>.+)_(?P<start>\d+\.\d+)-(?P<end>\d+\.\d+)$')
 
 
-def find_latest_scores_csv():
-    """Cherche le GUNSHOT_scores.csv le plus récent sous RESULTS_ROOT."""
-    candidates = sorted(glob(os.path.join(RESULTS_ROOT, "Outputs_predictions_*", "GUNSHOT_scores.csv")))
+def find_latest_output_dir():
+    """Cherche le dossier Outputs_predictions_* le plus récent sous RESULTS_ROOT."""
+    candidates = sorted(glob(os.path.join(RESULTS_ROOT, "Outputs_predictions_*")))
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
+
+
+def find_recorder_scores_csvs(output_dir):
+    """Trouve tous les GUNSHOT_scores.csv sous <output_dir>/<recorder_id>/."""
+    return sorted(glob(os.path.join(output_dir, "*", "GUNSHOT_scores.csv")))
 
 
 def parse_index(index_value):
@@ -97,6 +110,8 @@ def group_detections(df, max_gap_seconds):
                 'group_end_datetime': max(r['end_datetime'] for r in rows),
                 'best_start_datetime': best_row['start_datetime'],
                 'best_end_datetime': best_row['end_datetime'],
+                'best_start_time': best_row['start_time'],
+                'best_end_time': best_row['end_time'],
                 'best_score': best_row['positive'],
                 'best_index': best_row['index'],
             })
@@ -122,26 +137,22 @@ def group_detections(df, max_gap_seconds):
     return pd.DataFrame(groups)
 
 
-def main():
-    input_path = sys.argv[1] if len(sys.argv) > 1 else find_latest_scores_csv()
-    if not input_path or not os.path.isfile(input_path):
-        print("✗ Fichier GUNSHOT_scores.csv introuvable.")
-        print("  Précisez le chemin en argument, par exemple :")
-        print("  python deduplicate_detections.py /data/results/Outputs_predictions_XXXXXX/GUNSHOT_scores.csv")
-        sys.exit(1)
-
-    print(f"📄 Lecture de : {input_path}")
+def process_one_csv(input_path, quiet_prefix=""):
+    """
+    Traite un GUNSHOT_scores.csv (un seul enregistreur) : filtre, regroupe,
+    écrit GUNSHOT_scores_deduplicated.csv dans le même dossier.
+    Retourne (n_filtered, n_groups) ou (None, None) en cas d'échec/absence.
+    """
     df = pd.read_csv(input_path)
 
-    required_cols = {'index', 'start_datetime', 'end_datetime', 'positive'}
+    required_cols = {'index', 'start_datetime', 'end_datetime', 'start_time', 'end_time', 'positive'}
     missing = required_cols - set(df.columns)
     if missing:
-        print(f"✗ Colonnes manquantes dans le CSV : {sorted(missing)}")
-        print("  Ce script nécessite un GUNSHOT_scores.csv généré par la version à jour de predict.py")
-        print("  (avec les colonnes start_datetime / end_datetime).")
-        sys.exit(1)
+        print(f"{quiet_prefix}✗ Colonnes manquantes dans le CSV : {sorted(missing)}")
+        print(f"{quiet_prefix}  Ce script nécessite un GUNSHOT_scores.csv généré par la version à jour de predict.py")
+        print(f"{quiet_prefix}  (avec les colonnes start_datetime / end_datetime / start_time / end_time).")
+        return None, None
 
-    # Extraction filepath / start_sec / end_sec depuis la colonne 'index'
     parsed = df['index'].apply(parse_index)
     df['filepath']  = parsed.apply(lambda t: t[0])
     df['start_sec'] = parsed.apply(lambda t: t[1])
@@ -149,11 +160,11 @@ def main():
 
     n_total = len(df)
     df_filtered = df[df['positive'] >= SCORE_THRESHOLD].copy()
-    print(f"🎯 {len(df_filtered)} détection(s) à haut score (positive ≥ {SCORE_THRESHOLD}) sur {n_total} fenêtres analysées.")
+    print(f"{quiet_prefix}🎯 {len(df_filtered)} détection(s) à haut score (positive ≥ {SCORE_THRESHOLD}) sur {n_total} fenêtres analysées.")
 
     if df_filtered.empty:
-        print("✗ Aucune détection à haut score trouvée avec ce seuil.")
-        return
+        print(f"{quiet_prefix}✗ Aucune détection à haut score trouvée avec ce seuil.")
+        return 0, 0
 
     df_groups = group_detections(df_filtered, MAX_GAP_SECONDS)
     df_groups.sort_values(by=['file', 'group_start_datetime'], inplace=True)
@@ -163,11 +174,53 @@ def main():
     df_groups.to_csv(output_path, index=False)
 
     n_duplicates = len(df_filtered) - len(df_groups)
+    print(f"{quiet_prefix}✨ {len(df_filtered)} détections regroupées en {len(df_groups)} événement(s) distinct(s) "
+          f"({n_duplicates} doublon(s) éliminé(s)) -> {output_path}")
+
+    return len(df_filtered), len(df_groups)
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
+
+    # Mode fichier unique : rétrocompatibilité / usage manuel sur un enregistreur précis
+    if arg and os.path.isfile(arg):
+        print(f"📄 Mode fichier unique : {arg}")
+        process_one_csv(arg)
+        return
+
+    # Mode dossier : traite tous les enregistreurs trouvés sous ce dossier
+    output_dir = arg if (arg and os.path.isdir(arg)) else find_latest_output_dir()
+    if not output_dir or not os.path.isdir(output_dir):
+        print("✗ Dossier de résultats introuvable.")
+        print("  Précisez un dossier ou un fichier en argument, par exemple :")
+        print("  python deduplicate_detections.py /data/results/Outputs_predictions_XXXXXX")
+        sys.exit(1)
+
+    recorder_csvs = find_recorder_scores_csvs(output_dir)
+    if not recorder_csvs:
+        print(f"✗ Aucun GUNSHOT_scores.csv trouvé sous {output_dir}/<enregistreur>/")
+        print("  Vérifiez que predict.py a bien été exécuté et a produit des sous-dossiers par enregistreur.")
+        sys.exit(1)
+
+    print(f"📂 {len(recorder_csvs)} enregistreur(s) trouvé(s) sous : {output_dir}")
+
+    total_filtered = 0
+    total_groups = 0
+    n_processed = 0
+
+    for csv_path in recorder_csvs:
+        recorder_id = os.path.basename(os.path.dirname(csv_path))
+        print(f"\n— Enregistreur {recorder_id} —")
+        n_filtered, n_groups = process_one_csv(csv_path, quiet_prefix="  ")
+        if n_filtered is not None:
+            total_filtered += n_filtered
+            total_groups += n_groups
+            n_processed += 1
+
     print("\n" + "=" * 60)
-    print("✨ Regroupement terminé.")
-    print(f" -> {len(df_filtered)} détections à haut score regroupées en {len(df_groups)} événement(s) distinct(s).")
-    print(f" -> {n_duplicates} doublon(s) éliminé(s) (fenêtres fusionnées).")
-    print(f" -> Résultats sauvegardés dans : {output_path}")
+    print(f"✨ Regroupement terminé pour {n_processed}/{len(recorder_csvs)} enregistreur(s).")
+    print(f" -> {total_filtered} détections à haut score regroupées en {total_groups} événement(s) distinct(s) au total.")
     print("=" * 60)
 
 
