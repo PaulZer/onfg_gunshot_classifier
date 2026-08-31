@@ -87,9 +87,14 @@ docker compose exec onfg_gunshot_classifier python deduplicate_detections.py
 docker compose exec onfg_gunshot_classifier python cross_recorder_simultaneous_events.py
 ```
 
-Les étapes 2 et 3 recherchent automatiquement le `GUNSHOT_scores.csv` le plus récent — vous pouvez aussi leur passer un chemin explicite en argument, par exemple :
+Les étapes 2 et 3 recherchent automatiquement le dossier de résultats le plus récent (`Outputs_predictions_*`) et traitent tous les enregistreurs qu'il contient — vous pouvez aussi leur passer un chemin de dossier explicite en argument, par exemple :
 ```bash
-docker compose exec onfg_gunshot_classifier python deduplicate_detections.py /data/results/Outputs_predictions_260609/GUNSHOT_scores.csv
+docker compose exec onfg_gunshot_classifier python deduplicate_detections.py /data/results/Outputs_predictions_260609
+```
+
+💡 Pour retraiter un seul enregistreur (ex: après avoir changé `SCORE_THRESHOLD`), vous pouvez aussi passer directement le chemin de son `GUNSHOT_scores.csv` :
+```bash
+docker compose exec onfg_gunshot_classifier python deduplicate_detections.py /data/results/Outputs_predictions_260609/2MA01481/GUNSHOT_scores.csv
 ```
 
 Dans tous les cas, le programme affiche sa progression fichier par fichier (ex: `[1/12] Analyse de 2MA01481_20250423_133241.WAV`...).
@@ -99,10 +104,26 @@ Dans tous les cas, le programme affiche sa progression fichier par fichier (ex: 
 ### 📊 Étape 3 : Comprendre et lire les résultats
 Une fois l'analyse terminée, un nouveau dossier apparaît dans le dossier `results`. Son nom contient la date du jour (par exemple : `Outputs_predictions_260609`).
 
-À l'intérieur, vous trouverez jusqu'à quatre fichiers que vous pouvez ouvrir directement avec Excel, LibreOffice ou Google Sheets :
+Pour éviter d'accumuler un fichier unique trop volumineux sur plusieurs semaines de déploiement avec de nombreux enregistreurs, les résultats sont organisés **par enregistreur**, dans un sous-dossier nommé d'après son identifiant (extrait du nom des fichiers audio, voir Étape 1). Un seul fichier, à la racine, analyse l'ensemble du réseau :
 
-#### 1. `GUNSHOT_scores.csv` (Le plus complet)
-Ce fichier classe tous les morceaux analysés, du plus suspect au moins suspect. Le premier morceau de la liste est celui où le système est le plus certain d'avoir entendu un coup de feu.
+```
+Outputs_predictions_260609/
+├── 2MA01481/
+│   ├── GUNSHOT_scores.csv
+│   ├── GUNSHOT_binary_predictions.csv
+│   └── GUNSHOT_scores_deduplicated.csv
+├── 2MA01482/
+│   ├── GUNSHOT_scores.csv
+│   ├── GUNSHOT_binary_predictions.csv
+│   └── GUNSHOT_scores_deduplicated.csv
+├── ...  (un sous-dossier par enregistreur)
+└── SIMULTANEOUS_detections.csv
+```
+
+Tous ces fichiers `.csv` s'ouvrent directement avec Excel, LibreOffice ou Google Sheets.
+
+#### 1. `<enregistreur>/GUNSHOT_scores.csv` (Le plus complet)
+Ce fichier classe tous les morceaux analysés **pour cet enregistreur**, du plus suspect au moins suspect. Le premier morceau de la liste est celui où le système est le plus certain d'avoir entendu un coup de feu.
 
 Voici à quoi ressemblent les colonnes :
 
@@ -118,15 +139,15 @@ Voici à quoi ressemblent les colonnes :
 
 💡 Pour l'analyse, commencez par le haut du fichier, regardez la colonne `positive`, qui est triée par scores décroissants, et concentrez-vous sur les scores les plus proches de `1.0`. 
 
-#### 2. `GUNSHOT_binary_predictions.csv`
+#### 2. `<enregistreur>/GUNSHOT_binary_predictions.csv`
 Ce fichier applique une décision stricte ("Oui" ou "Non") selon un seuil scientifique pré-configuré (environ 80% de certitude). Mêmes colonnes que `GUNSHOT_scores.csv`.
 
 - Si la colonne `positive` affiche `1`, le système considère qu'il s'agit officiellement d'un coup de feu.
 
 - Si elle affiche `0`, le bruit est classé comme bruit de fond.
 
-#### 3. `GUNSHOT_scores_deduplicated.csv` (généré par `deduplicate_detections.py`)
-Comme les fenêtres d'analyse se chevauchent (chevauchement de 50% par défaut), un même coup de feu déclenche souvent **plusieurs détections consécutives à haut score**. Ce fichier les regroupe pour ne garder qu'**une seule ligne par événement réel**, au sein d'un même enregistreur.
+#### 3. `<enregistreur>/GUNSHOT_scores_deduplicated.csv` (généré par `deduplicate_detections.py`)
+Comme les fenêtres d'analyse se chevauchent (chevauchement de 50% par défaut), un même coup de feu déclenche souvent **plusieurs détections consécutives à haut score**. Ce fichier les regroupe pour ne garder qu'**une seule ligne par événement réel**, au sein de cet enregistreur.
 
 Colonnes principales :
 
@@ -134,21 +155,25 @@ Colonnes principales :
 - **file** : Le fichier audio concerné.
 - **n_windows_in_group** : Le nombre de fenêtres d'analyse qui ont été fusionnées dans ce groupe (un nombre élevé peut indiquer un son prolongé, ou plusieurs tirs très rapprochés).
 - **group_start_datetime** / **group_end_datetime** : L'étendue temporelle totale du groupe.
-- **best_start_datetime** / **best_end_datetime** / **best_score** / **best_index** : La fenêtre du groupe ayant obtenu le meilleur score — c'est celle à écouter en priorité pour une vérification manuelle.
+- **best_start_datetime** / **best_end_datetime** : La fenêtre du groupe ayant obtenu le meilleur score.
+- **best_start_time** / **best_end_time** : Le timecode de cette même fenêtre, **relatif au fichier audio** (équivalent à `start_time`/`end_time` de `GUNSHOT_scores.csv`) — pratique pour retrouver directement le passage dans un logiciel comme Audacity, sans recalculer à partir de la date absolue.
+- **best_score** / **best_index** : Le score et l'index de cette fenêtre — c'est celle à écouter en priorité pour une vérification manuelle.
 
 Deux paramètres réglables en tête du script permettent d'ajuster le comportement sans relancer l'analyse audio :
 - `SCORE_THRESHOLD` (par défaut `0.5`) : seuil de score à partir duquel une détection est prise en compte.
 - `MAX_GAP_SECONDS` (par défaut `2.0`) : écart maximal toléré, en secondes, entre deux fenêtres pour les considérer comme le même événement.
 
-#### 4. `SIMULTANEOUS_detections.csv` (généré par `cross_recorder_simultaneous_events.py`)
-Ce fichier recherche les cas où **plusieurs enregistreurs différents** ont capté, à peu de choses près, le même coup de feu au même moment — un signe de recoupement utile pour confirmer une détection ou reconstituer un secteur d'activité.
+#### 4. `SIMULTANEOUS_detections.csv` (à la racine, généré par `cross_recorder_simultaneous_events.py`)
+Contrairement aux trois fichiers précédents, celui-ci n'est **pas** dans un sous-dossier d'enregistreur : il analyse l'ensemble du réseau en combinant les `GUNSHOT_scores.csv` de tous les enregistreurs, pour repérer les cas où **plusieurs enregistreurs différents** ont capté, à peu de choses près, le même coup de feu au même moment — un signe de recoupement utile pour confirmer une détection ou reconstituer un secteur d'activité.
 
 Colonnes principales :
 
 - **cluster_id** : Identifiant du groupe de détections jugées simultanées.
 - **n_recorders_in_cluster** / **recorders_in_cluster** : Le nombre et la liste des enregistreurs impliqués dans ce groupe.
 - **recorder_id** / **file** : L'enregistreur et le fichier concernés par cette ligne.
-- **start_datetime** / **end_datetime** / **best_score** : La fenêtre et le score de l'événement, pour cet enregistreur.
+- **start_datetime** / **end_datetime** : La fenêtre absolue (étendue totale) de l'événement, pour cet enregistreur.
+- **start_time** / **end_time** : Le timecode de cette même fenêtre, **relatif au fichier audio**, sur la même étendue que `start_datetime`/`end_datetime`.
+- **best_score** : Le meilleur score de confiance au sein de cet événement.
 
 ⚠️ Le fichier n'est généré que s'il existe au moins un groupe impliquant 2 enregistreurs ou plus. Un chevauchement temporel entre deux enregistreurs est un **indice à vérifier**, pas une preuve absolue : deux coups de feu distincts peuvent survenir au même moment dans des secteurs différents. Deux paramètres réglables en tête du script :
 - `MAX_TIME_DIFF_SECONDS` (par défaut `15.0`) : tolérance temporelle entre enregistreurs pour juger deux détections "simultanées". Cette valeur doit couvrir à la fois le délai de propagation du son (~3 secondes pour 1 km) et surtout l'imprécision de synchronisation des horloges internes des enregistreurs, souvent le facteur dominant si vos appareils ne sont pas synchronisés par GPS.

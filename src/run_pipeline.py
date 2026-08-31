@@ -80,37 +80,42 @@ def main():
               [sys.executable, PREDICT_SCRIPT])
 
     output_dir = get_today_output_dir()
-    scores_csv = os.path.join(output_dir, "GUNSHOT_scores.csv")
+    recorder_csvs = glob(os.path.join(output_dir, "*", "GUNSHOT_scores.csv"))
 
-    if not os.path.isfile(scores_csv):
-        print(f"\n✗ Fichier attendu introuvable après l'étape 1 : {scores_csv}")
+    if not recorder_csvs:
+        print(f"\n✗ Aucun GUNSHOT_scores.csv trouvé sous {output_dir}/<enregistreur>/")
         print("  Le pipeline ne peut pas continuer sans ce fichier.")
         sys.exit(1)
+    print(f"\n📡 {len(recorder_csvs)} enregistreur(s) trouvé(s) sous : {output_dir}")
 
     # ── Étape 2 : déduplication au sein de chaque enregistreur ──────────
     run_step(2, 3, "Regroupement des doublons par enregistreur (deduplicate_detections.py)",
-              [sys.executable, DEDUPLICATE_SCRIPT, scores_csv])
+              [sys.executable, DEDUPLICATE_SCRIPT, output_dir])
 
     # ── Étape 3 : détections simultanées entre enregistreurs ────────────
     run_step(3, 3, "Recherche de détections simultanées entre enregistreurs (cross_recorder_simultaneous_events.py)",
-              [sys.executable, CROSS_RECORDER_SCRIPT, scores_csv])
+              [sys.executable, CROSS_RECORDER_SCRIPT, output_dir])
 
     # ── Récapitulatif final ───────────────────────────────────────────
     print("\n" + "═" * 70)
     print("✅ Pipeline complet terminé avec succès.")
     print(f"   Tous les résultats se trouvent dans : {output_dir}")
     print("═" * 70)
-    print("\nFichiers générés :")
-    expected_files = [
-        "GUNSHOT_scores.csv",
-        "GUNSHOT_binary_predictions.csv",
-        "GUNSHOT_scores_deduplicated.csv",
-        "SIMULTANEOUS_detections.csv",
-    ]
-    for fname in expected_files:
-        fpath = os.path.join(output_dir, fname)
-        status = "✓" if os.path.isfile(fpath) else "— (non généré, ex: aucune détection simultanée trouvée)"
-        print(f"   {status}  {fpath}")
+
+    print("\nFichiers générés par enregistreur :")
+    recorder_dirs = sorted(set(os.path.dirname(p) for p in recorder_csvs))
+    for recorder_dir in recorder_dirs:
+        recorder_id = os.path.basename(recorder_dir)
+        print(f"  📁 {recorder_id}/")
+        for fname in ["GUNSHOT_scores.csv", "GUNSHOT_binary_predictions.csv", "GUNSHOT_scores_deduplicated.csv"]:
+            fpath = os.path.join(recorder_dir, fname)
+            status = "✓" if os.path.isfile(fpath) else "✗ (non généré)"
+            print(f"      {status}  {fname}")
+
+    print("\nFichier de synthèse multi-enregistreurs :")
+    sim_path = os.path.join(output_dir, "SIMULTANEOUS_detections.csv")
+    status = "✓" if os.path.isfile(sim_path) else "— (non généré, ex: aucune détection simultanée trouvée)"
+    print(f"  {status}  {sim_path}")
 
 
 if __name__ == "__main__":
