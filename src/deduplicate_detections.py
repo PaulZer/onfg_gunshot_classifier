@@ -93,12 +93,18 @@ def fmt_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def group_detections(df, max_gap_seconds):
+def group_detections(df, max_gap_seconds, base_dt):
     """
     Regroupe les détections à haut score par fichier audio, en fusionnant
     celles dont les fenêtres se chevauchent ou sont séparées de moins de
     max_gap_seconds. Retourne un DataFrame avec une ligne par groupe
     (= un événement physique distinct).
+
+    base_dt : date/heure de début du PREMIER fichier de l'enregistreur
+    (calculée sur l'ensemble des fichiers, avant tout filtrage par score).
+    Sert de référence pour global_start_time / global_end_time, qui imitent
+    le temps continu affiché par Raven Lite en mode pagination (ne revient
+    pas à 0 d'un fichier à l'autre).
     """
     groups = []
     group_counter = 0
@@ -111,14 +117,20 @@ def group_detections(df, max_gap_seconds):
             group_counter += 1
             start_sec_group = min(r['start_sec'] for r in rows)
             end_sec_group = max(r['end_sec'] for r in rows)
+            group_start_dt_str = min(r['start_datetime'] for r in rows)
+            group_end_dt_str = max(r['end_datetime'] for r in rows)
+            elapsed_start_sec = (pd.to_datetime(group_start_dt_str) - base_dt).total_seconds()
+            elapsed_end_sec = (pd.to_datetime(group_end_dt_str) - base_dt).total_seconds()
             groups.append({
                 'group_id': group_counter,
                 'file': os.path.basename(filepath),
                 'n_windows_in_group': len(rows),
-                'group_start_datetime': min(r['start_datetime'] for r in rows),
-                'group_end_datetime': max(r['end_datetime'] for r in rows),
+                'group_start_datetime': group_start_dt_str,
+                'group_end_datetime': group_end_dt_str,
                 'group_start_time': fmt_time(start_sec_group),
                 'group_end_time': fmt_time(end_sec_group),
+                'global_start_time': fmt_time(elapsed_start_sec),
+                'global_end_time': fmt_time(elapsed_end_sec),
                 'average_score': sum(r['positive'] for r in rows) / len(rows),
             })
 
@@ -164,6 +176,15 @@ def process_one_csv(input_path, quiet_prefix=""):
     df['start_sec'] = parsed.apply(lambda t: t[1])
     df['end_sec']   = parsed.apply(lambda t: t[2])
 
+    # Reconstruction de la date de début du PREMIER fichier de l'enregistreur,
+    # à partir de TOUTES les fenêtres (avant filtrage par score), pour que la
+    # référence reste correcte même si les premiers fichiers n'ont aucune
+    # détection à haut score. Comme start_datetime = début_fichier + start_sec
+    # (voir predict.py), on peut retrouver le début du fichier à partir de
+    # n'importe quelle fenêtre survivante, quel que soit son score.
+    file_start_dt = pd.to_datetime(df['start_datetime']) - pd.to_timedelta(df['start_sec'], unit='s')
+    base_dt = file_start_dt.min()
+
     n_total = len(df)
     df_filtered = df[df['positive'] >= SCORE_THRESHOLD].copy()
     print(f"{quiet_prefix}🎯 {len(df_filtered)} détection(s) à haut score (positive ≥ {SCORE_THRESHOLD}) sur {n_total} fenêtres analysées.")
@@ -172,7 +193,7 @@ def process_one_csv(input_path, quiet_prefix=""):
         print(f"{quiet_prefix}✗ Aucune détection à haut score trouvée avec ce seuil.")
         return 0, 0
 
-    df_groups = group_detections(df_filtered, MAX_GAP_SECONDS)
+    df_groups = group_detections(df_filtered, MAX_GAP_SECONDS, base_dt)
     df_groups.sort_values(by=['file', 'group_start_datetime'], inplace=True)
 
     output_dir = os.path.dirname(input_path)

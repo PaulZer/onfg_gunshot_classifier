@@ -34,6 +34,21 @@ Au cœur de l'outil se trouve un **modèle entraîné**, c'est-à-dire un progra
 
 ---
 
+## Prérequis et installation de l'environnement Docker
+
+#### 1 - Installer Docker
+
+Suivre la documentation selon votre système d'exploitation
+
+#### 2 - Contruire l'image docker et démarrer le container
+
+Lancer cette commande depuis la racine du projet :
+
+```bash
+docker compose up -d --build
+```
+Au premier lancement, Docker construira l'image de l'environnement Linux. Cette image restera dans la mémoire cache de Docker, et une fois le build réalisé, votre container se lancera en quelques secondes.
+
 ## Guide d'utilisation
 
 
@@ -43,6 +58,7 @@ Avant de lancer l'analyse, vous devez copier vos fichiers audio au format `.WAV`
 
 * **Dossier d'entrée :** `audio_to_analyze` (ou le nom défini sur votre machine).
 * *Note : Veillez à ce que les extensions de vos fichiers soient bien `.wav` ou `.WAV`.*
+* Placez vos enregistrements à la racine du dossier (pas de sous-dossier). Les résultats seront organisés par enregistreurs dans des sous-dossiers dans le répertoire `results`.
 
 #### ⚠️ Convention de nommage requise
 
@@ -61,6 +77,7 @@ C'est le format par défaut de la plupart des enregistreurs autonomes (AudioMoth
 ---
 
 ### 🚀 Étape 2 : Lancer l'analyse
+Vérifiez bien que votre container Docker est actif avant de passer à cette étape.
 
 L'analyse complète comporte plusieurs traitements successifs (détection brute, puis élimination des doublons, puis recherche de détections simultanées entre enregistreurs). Deux façons de les lancer :
 

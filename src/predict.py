@@ -18,7 +18,6 @@ import os
 import re
 import sys
 import time
-import wave
 import warnings
 import traceback
 from collections import defaultdict
@@ -158,74 +157,6 @@ def get_recording_start_datetime(filepath, total_duration_sec):
     return recording_start_dt, "mtime_fallback"
 
 
-def get_audio_duration_fast(filepath):
-    """
-    Détermine rapidement la durée totale (en secondes) d'un fichier audio en
-    lisant uniquement son en-tête (sans charger tout l'audio en mémoire) —
-    beaucoup plus rapide que librosa.load pour un simple calcul de durée.
-    Repli sur librosa (plus lent, mais gère plus de formats/codecs) si le
-    fichier n'est pas un WAV PCM standard reconnu par le module `wave`.
-    """
-    try:
-        with wave.open(filepath, 'rb') as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            if rate > 0:
-                return frames / float(rate)
-    except Exception:
-        pass
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        y, sr = librosa.load(filepath, sr=None, mono=True)
-    return len(y) / float(sr)
-
-
-def build_global_time_offsets(file_list):
-    """
-    Pour chaque fichier audio, calcule son enregistreur, sa date/heure de
-    début, et son DÉCALAGE TEMPOREL CUMULÉ (en secondes) : la somme des
-    durées de tous les fichiers PRÉCÉDENTS du même enregistreur, triés
-    chronologiquement.
-
-    Ce décalage correspond au temps qu'afficherait Raven Lite pour le début
-    de ce fichier lorsqu'on ouvre plusieurs fichiers d'un même enregistreur
-    en mode pagination continue (le temps affiché ne revient pas à 0 à
-    chaque nouveau fichier, il s'additionne comme un seul enregistrement
-    continu).
-
-    Retourne un dict :
-        {filepath: {'recorder_id', 'start_dt', 'source', 'duration_sec',
-                     'global_offset_sec'}}
-    """
-    file_info = {}
-    for filepath in file_list:
-        recorder_id = extract_recorder_id(filepath)
-        duration_sec = get_audio_duration_fast(filepath)
-        start_dt, source = get_recording_start_datetime(filepath, duration_sec)
-        file_info[filepath] = {
-            'recorder_id': recorder_id,
-            'start_dt': start_dt,
-            'source': source,
-            'duration_sec': duration_sec,
-        }
-
-    by_recorder = defaultdict(list)
-    for filepath, info in file_info.items():
-        by_recorder[info['recorder_id']].append(filepath)
-
-    for recorder_id, filepaths in by_recorder.items():
-        # Ordre chronologique (date/heure de début), nom de fichier en
-        # critère de départage pour un ordre déterministe.
-        filepaths_sorted = sorted(filepaths, key=lambda f: (file_info[f]['start_dt'], f))
-        cumulative = 0.0
-        for filepath in filepaths_sorted:
-            file_info[filepath]['global_offset_sec'] = cumulative
-            cumulative += file_info[filepath]['duration_sec']
-
-    return file_info
-
-
 def load_target_model(model_path, sample_duration=4.0):
     from opensoundscape.torch.models.cnn import load_outdated_model
     with warnings.catch_warnings():
@@ -327,6 +258,16 @@ def main():
     # semaines de déploiement.
     results_by_recorder = defaultdict(lambda: {'scores': [], 'preds': []})
 
+    # Date de début du PREMIER fichier traité, par enregistreur. Sert de
+    # référence pour calculer un temps continu (voir global_start_time /
+    # global_end_time plus bas), qui imite le comportement de Raven Lite en
+    # mode pagination (temps écoulé depuis le début du premier fichier,
+    # sans revenir à 0 à chaque nouveau fichier). Mis à jour pour CHAQUE
+    # fichier traité, même ceux sans détection à haut score, afin que la
+    # référence reste correcte même si les tout premiers fichiers d'un
+    # enregistreur ne contiennent aucun coup de feu détecté.
+    recorder_first_file_start = {}
+
     model.network.eval()
     t_start = time.time()
 
@@ -347,6 +288,9 @@ def main():
                       f"'{os.path.basename(filepath)}' -> repli sur la date de "
                       f"modification (mtime). Vérifiez la convention de nommage "
                       f"ou la fiabilité de cette date.")
+
+            if recorder_id not in recorder_first_file_start or recording_start_dt < recorder_first_file_start[recorder_id]:
+                recorder_first_file_start[recorder_id] = recording_start_dt
 
             dataset = ClipDataset(clips, TARGET_SR, model.preprocessor)
             loader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=0)
@@ -422,7 +366,23 @@ def main():
         df_scores.sort_values(by=['positive'], ascending=False, inplace=True)
         df_preds = df_preds.reindex(df_scores.index)
 
-        desired_order = ['start_datetime', 'end_datetime', 'start_time', 'end_time', 'negative', 'positive']
+        # Temps continu depuis le début du PREMIER fichier de l'enregistreur
+        # (imite le comportement de Raven Lite en mode pagination, où le
+        # temps affiché ne revient pas à 0 d'un fichier à l'autre). La
+        # référence recorder_first_file_start est basée sur TOUS les
+        # fichiers traités pour cet enregistreur, même ceux sans détection à
+        # haut score, pour rester correcte même si les premiers jours
+        # d'enregistrement ne contiennent aucun coup de feu détecté.
+        base_dt = recorder_first_file_start[recorder_id]
+        start_dt_series = pd.to_datetime(df_scores['start_datetime'], format=DATETIME_FMT)
+        end_dt_series = pd.to_datetime(df_scores['end_datetime'], format=DATETIME_FMT)
+        df_scores['global_start_time'] = (start_dt_series - base_dt).dt.total_seconds().apply(fmt_time)
+        df_scores['global_end_time'] = (end_dt_series - base_dt).dt.total_seconds().apply(fmt_time)
+        df_preds['global_start_time'] = df_scores['global_start_time']
+        df_preds['global_end_time'] = df_scores['global_end_time']
+
+        desired_order = ['start_datetime', 'end_datetime', 'start_time', 'end_time',
+                          'global_start_time', 'global_end_time', 'negative', 'positive']
         df_scores = df_scores[desired_order]
         df_preds = df_preds[desired_order]
 
