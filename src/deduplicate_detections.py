@@ -85,6 +85,14 @@ def parse_index(index_value):
     return m.group('filepath'), float(m.group('start')), float(m.group('end'))
 
 
+def fmt_time(seconds):
+    """Convertit des secondes (relatives au fichier) en HH:MM:SS."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def group_detections(df, max_gap_seconds):
     """
     Regroupe les détections à haut score par fichier audio, en fusionnant
@@ -101,19 +109,17 @@ def group_detections(df, max_gap_seconds):
         def flush_group(rows):
             nonlocal group_counter
             group_counter += 1
-            best_row = max(rows, key=lambda r: r['positive'])
+            start_sec_group = min(r['start_sec'] for r in rows)
+            end_sec_group = max(r['end_sec'] for r in rows)
             groups.append({
                 'group_id': group_counter,
                 'file': os.path.basename(filepath),
                 'n_windows_in_group': len(rows),
                 'group_start_datetime': min(r['start_datetime'] for r in rows),
                 'group_end_datetime': max(r['end_datetime'] for r in rows),
-                'best_start_datetime': best_row['start_datetime'],
-                'best_end_datetime': best_row['end_datetime'],
-                'best_start_time': best_row['start_time'],
-                'best_end_time': best_row['end_time'],
-                'best_score': best_row['positive'],
-                'best_index': best_row['index'],
+                'group_start_time': fmt_time(start_sec_group),
+                'group_end_time': fmt_time(end_sec_group),
+                'average_score': sum(r['positive'] for r in rows) / len(rows),
             })
 
         current_group_rows = [sub.iloc[0]]
@@ -145,12 +151,12 @@ def process_one_csv(input_path, quiet_prefix=""):
     """
     df = pd.read_csv(input_path)
 
-    required_cols = {'index', 'start_datetime', 'end_datetime', 'start_time', 'end_time', 'positive'}
+    required_cols = {'index', 'start_datetime', 'end_datetime', 'positive'}
     missing = required_cols - set(df.columns)
     if missing:
         print(f"{quiet_prefix}✗ Colonnes manquantes dans le CSV : {sorted(missing)}")
         print(f"{quiet_prefix}  Ce script nécessite un GUNSHOT_scores.csv généré par la version à jour de predict.py")
-        print(f"{quiet_prefix}  (avec les colonnes start_datetime / end_datetime / start_time / end_time).")
+        print(f"{quiet_prefix}  (avec les colonnes start_datetime / end_datetime).")
         return None, None
 
     parsed = df['index'].apply(parse_index)

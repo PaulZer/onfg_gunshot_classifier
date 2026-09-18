@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+import wave
 import warnings
 import traceback
 from collections import defaultdict
@@ -155,6 +156,74 @@ def get_recording_start_datetime(filepath, total_duration_sec):
     recording_end_dt = datetime.fromtimestamp(mtime)
     recording_start_dt = recording_end_dt - timedelta(seconds=total_duration_sec)
     return recording_start_dt, "mtime_fallback"
+
+
+def get_audio_duration_fast(filepath):
+    """
+    Détermine rapidement la durée totale (en secondes) d'un fichier audio en
+    lisant uniquement son en-tête (sans charger tout l'audio en mémoire) —
+    beaucoup plus rapide que librosa.load pour un simple calcul de durée.
+    Repli sur librosa (plus lent, mais gère plus de formats/codecs) si le
+    fichier n'est pas un WAV PCM standard reconnu par le module `wave`.
+    """
+    try:
+        with wave.open(filepath, 'rb') as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            if rate > 0:
+                return frames / float(rate)
+    except Exception:
+        pass
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        y, sr = librosa.load(filepath, sr=None, mono=True)
+    return len(y) / float(sr)
+
+
+def build_global_time_offsets(file_list):
+    """
+    Pour chaque fichier audio, calcule son enregistreur, sa date/heure de
+    début, et son DÉCALAGE TEMPOREL CUMULÉ (en secondes) : la somme des
+    durées de tous les fichiers PRÉCÉDENTS du même enregistreur, triés
+    chronologiquement.
+
+    Ce décalage correspond au temps qu'afficherait Raven Lite pour le début
+    de ce fichier lorsqu'on ouvre plusieurs fichiers d'un même enregistreur
+    en mode pagination continue (le temps affiché ne revient pas à 0 à
+    chaque nouveau fichier, il s'additionne comme un seul enregistrement
+    continu).
+
+    Retourne un dict :
+        {filepath: {'recorder_id', 'start_dt', 'source', 'duration_sec',
+                     'global_offset_sec'}}
+    """
+    file_info = {}
+    for filepath in file_list:
+        recorder_id = extract_recorder_id(filepath)
+        duration_sec = get_audio_duration_fast(filepath)
+        start_dt, source = get_recording_start_datetime(filepath, duration_sec)
+        file_info[filepath] = {
+            'recorder_id': recorder_id,
+            'start_dt': start_dt,
+            'source': source,
+            'duration_sec': duration_sec,
+        }
+
+    by_recorder = defaultdict(list)
+    for filepath, info in file_info.items():
+        by_recorder[info['recorder_id']].append(filepath)
+
+    for recorder_id, filepaths in by_recorder.items():
+        # Ordre chronologique (date/heure de début), nom de fichier en
+        # critère de départage pour un ordre déterministe.
+        filepaths_sorted = sorted(filepaths, key=lambda f: (file_info[f]['start_dt'], f))
+        cumulative = 0.0
+        for filepath in filepaths_sorted:
+            file_info[filepath]['global_offset_sec'] = cumulative
+            cumulative += file_info[filepath]['duration_sec']
+
+    return file_info
 
 
 def load_target_model(model_path, sample_duration=4.0):
