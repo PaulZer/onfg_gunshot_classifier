@@ -146,12 +146,20 @@ def fmt_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def dedup_within_recorder(df, max_gap_seconds):
+def dedup_within_recorder(df, max_gap_seconds, base_dt_by_recorder):
     """
     Étape 1 : fusionne, pour chaque FICHIER, les fenêtres qui se
     chevauchent ou sont séparées de moins de max_gap_seconds.
     Retourne un DataFrame avec une ligne par événement détecté
     (un enregistreur / un fichier donné peut avoir plusieurs événements).
+
+    base_dt_by_recorder : dict {recorder_id: date/heure de début du premier
+    fichier de cet enregistreur}, calculé sur l'ensemble des fichiers avant
+    tout filtrage par score. Sert de référence pour global_start_time /
+    global_end_time, qui imitent le temps continu affiché par Raven Lite en
+    mode pagination (ne revient pas à 0 d'un fichier à l'autre). Calculé à
+    partir des horodatages BRUTS (sans CLOCK_OFFSETS), pour rester fidèle
+    aux fichiers tels qu'ouverts dans Raven Lite.
     """
     events = []
     event_counter = 0
@@ -160,18 +168,26 @@ def dedup_within_recorder(df, max_gap_seconds):
         sub = sub.sort_values('start_sec').reset_index(drop=True)
         recorder_id = extract_recorder_id(filepath)
         offset = CLOCK_OFFSETS.get(recorder_id, 0)
+        base_dt = base_dt_by_recorder[recorder_id]
 
         def flush(rows):
             nonlocal event_counter
             event_counter += 1
             best_row = max(rows, key=lambda r: r['positive'])
-            start_dt = min(pd.to_datetime(r['start_datetime']) for r in rows) + timedelta(seconds=offset)
-            end_dt = max(pd.to_datetime(r['end_datetime']) for r in rows) + timedelta(seconds=offset)
+            raw_start_dt = min(pd.to_datetime(r['start_datetime']) for r in rows)
+            raw_end_dt = max(pd.to_datetime(r['end_datetime']) for r in rows)
+            start_dt = raw_start_dt + timedelta(seconds=offset)
+            end_dt = raw_end_dt + timedelta(seconds=offset)
             # Timecode relatif au fichier (équivalent start_time/end_time de
             # GUNSHOT_scores.csv), sur la même étendue que start_dt/end_dt,
             # pour retrouver facilement le passage dans l'enregistrement.
             start_sec_group = min(r['start_sec'] for r in rows)
             end_sec_group = max(r['end_sec'] for r in rows)
+            # Temps continu depuis le début du premier fichier de CET
+            # enregistreur (basé sur les horodatages bruts, pas corrigés par
+            # CLOCK_OFFSETS, pour coller au temps affiché par Raven Lite).
+            global_start_sec = (raw_start_dt - base_dt).total_seconds()
+            global_end_sec = (raw_end_dt - base_dt).total_seconds()
             events.append({
                 'event_id': event_counter,
                 'recorder_id': recorder_id,
@@ -181,6 +197,8 @@ def dedup_within_recorder(df, max_gap_seconds):
                 'end_datetime': end_dt,
                 'start_time': fmt_time(start_sec_group),
                 'end_time': fmt_time(end_sec_group),
+                'global_start_time': fmt_time(global_start_sec),
+                'global_end_time': fmt_time(global_end_sec),
                 'best_score': best_row['positive'],
                 'best_index': best_row['index'],
             })
@@ -273,6 +291,14 @@ def main():
     df['start_sec'] = parsed.apply(lambda t: t[1])
     df['end_sec']   = parsed.apply(lambda t: t[2])
 
+    # Reconstruction de la date de début du PREMIER fichier de chaque
+    # enregistreur, à partir de TOUTES les fenêtres (avant filtrage par
+    # score), pour que la référence reste correcte même si les premiers
+    # fichiers n'ont aucune détection à haut score.
+    df['_recorder_id'] = df['filepath'].apply(extract_recorder_id)
+    df['_file_start_dt'] = pd.to_datetime(df['start_datetime']) - pd.to_timedelta(df['start_sec'], unit='s')
+    base_dt_by_recorder = df.groupby('_recorder_id')['_file_start_dt'].min().to_dict()
+
     n_total = len(df)
     df_filtered = df[df['positive'] >= SCORE_THRESHOLD].copy()
     print(f"🎯 {len(df_filtered)} fenêtre(s) à haut score (positive ≥ {SCORE_THRESHOLD}) sur {n_total} analysées.")
@@ -289,7 +315,7 @@ def main():
         return
 
     # Étape 1 : un événement par détection réelle, par enregistreur
-    events_df = dedup_within_recorder(df_filtered, MAX_GAP_WITHIN_RECORDER_SECONDS)
+    events_df = dedup_within_recorder(df_filtered, MAX_GAP_WITHIN_RECORDER_SECONDS, base_dt_by_recorder)
     print(f"🔗 {len(df_filtered)} fenêtres regroupées en {len(events_df)} événement(s) par enregistreur.")
 
     # Étape 2 : regroupement entre enregistreurs différents
@@ -321,7 +347,7 @@ def main():
     out_cols = [
         'cluster_id', 'n_recorders_in_cluster', 'recorders_in_cluster',
         'recorder_id', 'file', 'start_datetime', 'end_datetime',
-        'start_time', 'end_time',
+        'start_time', 'end_time', 'global_start_time', 'global_end_time',
         'best_score', 'n_windows_in_group', 'best_index'
     ]
     simultaneous_df[out_cols].to_csv(output_path, index=False)
